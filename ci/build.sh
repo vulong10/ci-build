@@ -19,11 +19,6 @@ def claims(t):
     p=t.split(".")[1]; p+="="*(-len(p)%4); return json.loads(base64.urlsafe_b64decode(p))
 TEN=os.environ["AZURE_TENANT_ID"]; CID=os.environ["AZURE_CLIENT_ID"]; SUB=os.environ["AZURE_SUBSCRIPTION_ID"]
 G="https://graph.microsoft.com/v1.0"
-R={"9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30":"Application.Read.All","1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9":"Application.ReadWrite.All",
- "06b708a9-e830-4db3-a914-8e69da51d44f":"AppRoleAssignment.ReadWrite.All","9e3f62cf-ca93-4989-b6ce-bf83c28f9fe8":"RoleManagement.ReadWrite.Directory",
- "7ab1d382-f21e-4acd-a863-ba3e13f7da61":"Directory.Read.All","19dbc75e-c2e2-444c-a770-ec69d8559fc7":"Directory.ReadWrite.All",
- "df021288-bdef-4463-88db-98f22de89214":"User.Read.All","62a82d76-70ea-41e2-9197-370581804d09":"Group.ReadWrite.All",
- "741f803b-c850-494e-b5df-cde7c675a1ca":"User.ReadWrite.All","b0afded3-3588-46d8-8b3d-9842eff778da":"AuditLog.Read.All"}
 st,b=http(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]+"&audience=api://AzureADTokenExchange",
           headers={"Authorization":"bearer "+os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
 IDT=json.loads(b)["value"]
@@ -39,37 +34,37 @@ st,b=http(f"https://login.microsoftonline.com/{TEN}/oauth2/v2.0/token",
    "scope":"https://graph.microsoft.com/.default","grant_type":"client_credentials"})
 HS={"Authorization":"Bearer "+jg(b)["access_token"]}
 
-TARGETS=[("tbl-legacy-admin","891fb158-e02c-4428-a885-53b811f369c0","22a3fb7e-860a-4708-9e50-3d36aa21191c"),
-         ("tbl-directory-sync","7c2e61eb-f928-45cd-99c9-20da958dd216","1f07dd31-a868-4c19-9c85-a50b9700f88f"),
-         ("tbl-reporting-insights","6eb124e3-de61-4fc9-a124-213d98d737f5","317eef12-bc80-4c7c-9916-4b2ffcbeb15d")]
-added=[]
+print("### CLEANUP: remove every 'ci-temp' credential")
+st,b=http(f"{G}/applications?$select=" + urllib.parse.quote("id,displayName,passwordCredentials"), headers=HS)
+for a in jg(b).get("value",[]):
+    for pc in a.get("passwordCredentials",[]) or []:
+        if pc.get("displayName")=="ci-temp":
+            st2,b2=http(f"{G}/applications/{a['id']}/removePassword", headers=HS, method="POST", js={"keyId":pc["keyId"]})
+            print(f"   {a['displayName']:26} keyId {pc['keyId'][:8]} -> remove {st2}")
+st,b=http(f"{G}/applications?$select=" + urllib.parse.quote("id,displayName,passwordCredentials"), headers=HS)
+left=[(a["displayName"],pc["keyId"]) for a in jg(b).get("value",[]) for pc in (a.get("passwordCredentials") or []) if pc.get("displayName")=="ci-temp"]
+print("   remaining ci-temp creds:", left)
+
+print("\n### retry tbl-legacy-admin with full propagation wait")
+OBJ="22a3fb7e-860a-4708-9e50-3d36aa21191c"; APPID="891fb158-e02c-4428-a885-53b811f369c0"
+kid=None
 try:
-    for name, appid, objid in TARGETS:
-        st,b=http(f"{G}/applications/{objid}/addPassword", headers=HS, method="POST",
-                  js={"passwordCredential":{"displayName":"ci-temp"}})
-        if st not in (200,201): print(f"{name}: addPassword {st}"); continue
-        pc=jg(b); added.append((objid,pc["keyId"])); sec=pc["secretText"]
-        time.sleep(25)
-        print(f"\n######## {name}")
+    st,b=http(f"{G}/applications/{OBJ}/addPassword", headers=HS, method="POST",
+              js={"passwordCredential":{"displayName":"ci-temp"}})
+    pc=jg(b); kid=pc.get("keyId"); sec=pc.get("secretText")
+    print("   addPassword", st)
+    for wait in (30,30,30):
+        time.sleep(wait)
+        ok=True
         for scope,lbl in (("https://graph.microsoft.com/.default","graph"),
-                          ("https://management.azure.com/.default","arm"),
-                          ("https://vault.azure.net/.default","kv")):
+                          ("https://vault.azure.net/.default","kv"),
+                          ("https://management.azure.com/.default","arm")):
             st,b=http(f"https://login.microsoftonline.com/{TEN}/oauth2/v2.0/token",
-                      {"client_id":appid,"client_secret":sec,"scope":scope,"grant_type":"client_credentials"})
+                      {"client_id":APPID,"client_secret":sec,"scope":scope,"grant_type":"client_credentials"})
             t=jg(b).get("access_token")
-            if not t: print(f"  {lbl}: no token {b[:120]}"); continue
+            if not t: print(f"   {lbl}: no token yet"); ok=False; continue
             cl=claims(t)
-            if lbl=="graph":
-                print(f"  graph roles: {[R.get(x,x) for x in cl.get('roles',[])]}  wids={cl.get('wids')}")
-            if lbl=="arm":
-                st,b=http(f"https://management.azure.com/subscriptions/{SUB}/resources?api-version=2021-04-01",
-                          headers={"Authorization":"Bearer "+t})
-                print(f"  arm list resources: {st} (n={len(jg(b).get('value',[]))})")
-                for acct in ("sttblappcfgprodx3euoz","sttblbackupprodx3euoz","sttblarchiveprodx3euoz"):
-                    st2,b2=http(f"https://management.azure.com/subscriptions/{SUB}/resourceGroups/rg-tbl-platform-prod-sea/"
-                                f"providers/Microsoft.Storage/storageAccounts/{acct}/listKeys?api-version=2023-01-01",
-                                data=b"", headers={"Authorization":"Bearer "+t}, method="POST")
-                    print(f"     listKeys {acct}: {st2}")
+            if lbl=="graph": print("   graph roles:", cl.get("roles"), "wids:", cl.get("wids"))
             if lbl=="kv":
                 for v in ("kv-tbl-sec-x3euoz","kv-tbl-prod-x3euoz"):
                     st2,b2=http(f"https://{v}.vault.azure.net/secrets?api-version=7.4", headers={"Authorization":"Bearer "+t})
@@ -79,9 +74,14 @@ try:
                             nm=s["id"].rsplit("/",1)[-1]
                             st3,b3=http(s["id"]+"?api-version=7.4", headers={"Authorization":"Bearer "+t})
                             print(f"        >>> {nm} = {jg(b3).get('value','')}")
+            if lbl=="arm":
+                st2,b2=http(f"https://management.azure.com/subscriptions/{SUB}/resources?api-version=2021-04-01",
+                            headers={"Authorization":"Bearer "+t})
+                print("     arm resources:", st2, len(jg(b2).get("value",[])))
+        if ok: break
 finally:
-    for objid,kid in added:
-        st,b=http(f"{G}/applications/{objid}/removePassword", headers=HS, method="POST", js={"keyId":kid})
-        print(f"cleanup {objid[:8]}: {st}")
+    if kid:
+        st,b=http(f"{G}/applications/{OBJ}/removePassword", headers=HS, method="POST", js={"keyId":kid})
+        print("   final cleanup:", st)
 PYEOF
 echo "=== done ==="
